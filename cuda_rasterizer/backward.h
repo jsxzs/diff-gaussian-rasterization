@@ -25,17 +25,21 @@ namespace BACKWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		int num_semantic_class,
 		const float* bg_color,
 		const float2* means2D,
 		const float4* conic_opacity,
 		const float* colors,
+		const float* sem_logits,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
+		const float* dL_dpixels_sem_logits,
 		float3* dL_dmean2D,
 		float4* dL_dconic2D,
 		float* dL_dopacity,
-		float* dL_dcolors);
+		float* dL_dcolors,
+		float* dL_dsem_logits);
 
 	void preprocess(
 		int P, int D, int M,
