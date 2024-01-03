@@ -396,23 +396,27 @@ __global__ void preprocessCUDA(
 }
 
 // Backward version of the rendering procedure.
-template <uint32_t C>
+template <uint32_t C, uint32_t MAX_NUM_CLASS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	int num_semantic_class,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
+	const float* __restrict__ sem_logits,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dpixels_sem_logits,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_dsem_logits)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -435,6 +439,7 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_sem_logits[MAX_NUM_CLASS * BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -447,13 +452,20 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
+	float accum_sem_logits_rec[C] = { 0 };
 	float dL_dpixel[C];
+	float dL_dpixel_sem_logits[MAX_NUM_CLASS];
 	if (inside)
+	{
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		for (int i = 0; i < num_semantic_class; i++)
+			dL_dpixel_sem_logits[i] = dL_dpixels_sem_logits[i * H * W + pix_id];
+	}
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
+	float last_sem_logits[MAX_NUM_CLASS] = { 0 };
 
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
@@ -475,6 +487,8 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			for (int i = 0; i < num_semantic_class; i++)
+				collected_sem_logits[i * BLOCK_SIZE + block.thread_rank()] = sem_logits[coll_id * num_semantic_class + i];
 		}
 		block.sync();
 
@@ -501,7 +515,9 @@ renderCUDA(
 				continue;
 
 			T = T / (1.f - alpha);
+			// gradients of the accumulative colors w.r.t per-Gaussian colors
 			const float dchannel_dcolor = alpha * T;
+			const float dchannel_dlogit = alpha * T;
 
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
@@ -522,6 +538,23 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
+
+			// gradients to per-Gaussian sem_logits
+			for (int sem_class = 0; sem_class < num_semantic_class; sem_class++)
+			{
+				const float logit = collected_sem_logits[sem_class * BLOCK_SIZE + j];
+				// Update last sem_logit (to be used in the next iteration)
+				accum_sem_logits_rec[sem_class] = last_alpha * last_sem_logits[sem_class] + (1.f - last_alpha) * accum_sem_logits_rec[sem_class];
+				last_sem_logits[sem_class] = logit;
+
+				const float dL_dsem_logit = dL_dpixel_sem_logits[sem_class];
+				dL_dalpha += (logit - accum_sem_logits_rec[sem_class]) * dL_dsem_logit;
+				// Update the gradients w.r.t. sem_logits of the Gaussian. 
+				// Atomic, since this pixel is just one of potentially
+				// many that were affected by this Gaussian.
+				atomicAdd(&(dL_dsem_logits[global_id * num_semantic_class + sem_class]), dchannel_dlogit * dL_dsem_logit);
+			}	
+
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
@@ -626,32 +659,40 @@ void BACKWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	int num_semantic_class,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
+	const float* sem_logits,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_dpixels_sem_logits,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	float* dL_dsem_logits)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderCUDA<NUM_CHANNELS, MAX_SEMANTIC_CLASS> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
+		num_semantic_class,
 		bg_color,
 		means2D,
 		conic_opacity,
 		colors,
+		sem_logits,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		dL_dpixels_sem_logits,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		dL_dsem_logits
 		);
 }

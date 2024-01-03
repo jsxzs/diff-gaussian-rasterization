@@ -258,19 +258,22 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, uint32_t MAX_NUM_CLASS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	int W, int H, 
+	const int num_semantic_class,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ sem_logits,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
-	float* __restrict__ out_color)
+	float* __restrict__ out_color,
+	float* __restrict__ out_sem_logits)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -301,6 +304,7 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float Sem[MAX_NUM_CLASS] = {0}; // add
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -353,6 +357,11 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+			
+			// add
+			// Eq. (4) from Semantic-NeRF paper.
+			for ( int sem_class = 0; sem_class < num_semantic_class; sem_class++)
+				Sem[sem_class] += sem_logits[collected_id[j] * num_semantic_class + sem_class] * alpha * T;
 
 			T = test_T;
 
@@ -370,6 +379,9 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		// add
+		for ( int sem_class = 0; sem_class < num_semantic_class; sem_class++)
+			out_sem_logits[sem_class * H * W + pix_id] = Sem[sem_class];
 	}
 }
 
@@ -377,26 +389,32 @@ void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, 
+	const int num_semantic_class,
 	const float2* means2D,
 	const float* colors,
+	const float* sem_logits,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
-	float* out_color)
+	float* out_color,
+	float* out_sem_logits)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS, MAX_SEMANTIC_CLASS> << <grid, block >> > (
 		ranges,
 		point_list,
-		W, H,
+		W, H, 
+		num_semantic_class,
 		means2D,
 		colors,
+		sem_logits,
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
-		out_color);
+		out_color,
+		out_sem_logits);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
